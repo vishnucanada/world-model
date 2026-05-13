@@ -1,13 +1,20 @@
 """Train the state-space world model with multi-step rollout loss.
 
-Generates a transition dataset (if missing), fits a residual-over-baseline
-MLP using k-step rollout MSE (the model is unrolled k steps, predictions
-fed back as inputs, loss summed across all k steps), and saves a
-self-contained checkpoint.
+Key training choices:
+  * residual-over-baseline model (see ``world_model.model``)
+  * curriculum: rollout-len ramps from ``--rollout-len-start`` to
+    ``--rollout-len`` linearly over the first half of training so the
+    network learns one-step dynamics cleanly before being held
+    accountable for long chains.
+  * per-dim normalized loss: MSE is taken in units of ``state_std`` so
+    position and velocity dimensions contribute proportionally and
+    long-horizon errors don't drown out short-horizon ones.
+  * cosine learning-rate annealing.
 """
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import numpy as np
@@ -26,15 +33,17 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=Path, default=Path("data/transitions.npz"))
     p.add_argument("--out", type=Path, default=Path("checkpoints/world_model.pt"))
-    p.add_argument("--episodes", type=int, default=200)
+    p.add_argument("--episodes", type=int, default=300)
     p.add_argument("--steps", type=int, default=120)
     p.add_argument("--n-balls", type=int, default=5)
-    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--batches-per-epoch", type=int, default=64)
-    p.add_argument("--rollout-len", type=int, default=10)
+    p.add_argument("--rollout-len", type=int, default=16, help="max rollout length")
+    p.add_argument("--rollout-len-start", type=int, default=3, help="initial rollout length for curriculum")
     p.add_argument("--lr", type=float, default=3e-3)
-    p.add_argument("--hidden", type=int, default=256)
+    p.add_argument("--lr-min", type=float, default=1e-4)
+    p.add_argument("--hidden", type=int, default=384)
     p.add_argument("--layers", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -67,7 +76,6 @@ def main() -> None:
     model = DynamicsMLP(state_dim, action_dim, hidden=args.hidden, n_layers=args.layers).to(device)
     model.set_physics(dt=dt, gravity_y=gravity_y, mass=mass)
 
-    # Correction-target scale: std of (truth - ballistic) over all one-step transitions.
     s_flat = torch.from_numpy(states[:, :-1].reshape(-1, state_dim))
     sn_flat = torch.from_numpy(states[:, 1:].reshape(-1, state_dim))
     a_flat = torch.from_numpy(actions.reshape(-1, action_dim))
@@ -92,17 +100,31 @@ def main() -> None:
     actions_t = torch.from_numpy(actions).to(device)
     n_eps = states_t.shape[0]
     T = actions_t.shape[1]
-    K = args.rollout_len
-    if K > T:
-        raise ValueError(f"rollout-len {K} exceeds episode length {T}")
-    starts_max = T - K + 1
-    k_state = torch.arange(K + 1, device=device)
-    k_act = torch.arange(K, device=device)
+    K_max = args.rollout_len
+    K_start = max(1, min(args.rollout_len_start, K_max))
+    if K_max > T:
+        raise ValueError(f"rollout-len {K_max} exceeds episode length {T}")
+
+    # Loss normalization: errors measured in per-dim "fractions of std".
+    loss_scale = torch.as_tensor(data["state_std"], dtype=torch.float32, device=device)
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    total_steps = args.epochs * args.batches_per_epoch
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps, eta_min=args.lr_min)
 
-    print(f"training {args.epochs} epochs, {K}-step rollout loss...")
+    ramp_epochs = max(1, args.epochs // 2)
+    print(
+        f"training {args.epochs} epochs, curriculum K={K_start}->{K_max} "
+        f"over {ramp_epochs} epochs, normalized loss + cosine LR"
+    )
     for epoch in range(args.epochs):
+        # Linear ramp during the first half, then hold at K_max.
+        t = min(1.0, epoch / max(1, ramp_epochs - 1))
+        K = int(round(K_start + t * (K_max - K_start)))
+        starts_max = T - K + 1
+        k_state = torch.arange(K + 1, device=device)
+        k_act = torch.arange(K, device=device)
+
         total = 0.0
         for _ in range(args.batches_per_epoch):
             ei = torch.randint(0, n_eps, (args.batch_size,), device=device)
@@ -114,17 +136,23 @@ def main() -> None:
             loss = 0.0
             for k in range(K):
                 s_pred = model(s_pred, act_seq[:, k])
-                loss = loss + ((s_pred - seq[:, k + 1]) ** 2).mean()
+                err = (s_pred - seq[:, k + 1]) / loss_scale
+                loss = loss + (err ** 2).mean()
             loss = loss / K
 
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            sched.step()
             total += loss.item()
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  epoch {epoch + 1:02d}/{args.epochs}  rollout_mse={total / args.batches_per_epoch:.4f}")
+            lr_now = opt.param_groups[0]["lr"]
+            print(
+                f"  epoch {epoch + 1:02d}/{args.epochs}  K={K:2d}  lr={lr_now:.2e}  "
+                f"norm_mse={total / args.batches_per_epoch:.4f}"
+            )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
