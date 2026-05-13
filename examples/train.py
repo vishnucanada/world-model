@@ -138,9 +138,17 @@ def main() -> None:
             s_pred = seq[:, 0]
             loss = 0.0
             for k in range(K):
-                s_pred = model(s_pred, act_seq[:, k])
-                err = (s_pred - seq[:, k + 1]) / loss_scale
-                loss = loss + (err ** 2).mean()
+                if args.stochastic:
+                    s_pred, log_var = model.predict_with_var(s_pred, act_seq[:, k])
+                    log_var = torch.clamp(log_var, min=-8.0, max=8.0)
+                    err_n = (s_pred - seq[:, k + 1]) / loss_scale
+                    # Gaussian NLL in normalized units (constant term dropped).
+                    nll = 0.5 * (err_n ** 2 * torch.exp(-log_var) + log_var)
+                    loss = loss + nll.mean()
+                else:
+                    s_pred = model(s_pred, act_seq[:, k])
+                    err_n = (s_pred - seq[:, k + 1]) / loss_scale
+                    loss = loss + (err_n ** 2).mean()
             loss = loss / K
 
             opt.zero_grad()
@@ -156,6 +164,27 @@ def main() -> None:
                 f"  epoch {epoch + 1:02d}/{args.epochs}  K={K:2d}  lr={lr_now:.2e}  "
                 f"norm_mse={total / args.batches_per_epoch:.4f}"
             )
+
+    if args.stochastic:
+        # Calibration check: do steps with high predicted variance have high actual error?
+        model.eval()
+        with torch.no_grad():
+            s_sample = s_flat[:5000].to(device)
+            a_sample = a_flat[:5000].to(device)
+            tgt_sample = sn_flat[:5000].to(device)
+            mean_p, log_var = model.predict_with_var(s_sample, a_sample)
+            log_var = torch.clamp(log_var, min=-8.0, max=8.0)
+            err2_n = (((mean_p - tgt_sample) / loss_scale) ** 2).mean(dim=-1)
+            std_n = torch.exp(0.5 * log_var.mean(dim=-1))
+            # Rank steps by predicted std and bucket into quintiles.
+            order = std_n.argsort()
+            buckets = err2_n[order].view(5, -1).mean(dim=1).sqrt()
+            std_buckets = std_n[order].view(5, -1).mean(dim=1)
+            print("\nuncertainty calibration (5 quintiles by predicted std):")
+            print("  bucket | mean predicted std | mean actual RMSE (normalized)")
+            for i in range(5):
+                print(f"     Q{i + 1}  | {std_buckets[i].item():>16.3f}   | {buckets[i].item():>10.3f}")
+        model.train()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
