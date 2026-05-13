@@ -1,9 +1,9 @@
-"""PyTorch state-space world model.
+"""PyTorch state-space world model: residual over a free-flight baseline.
 
-A small residual MLP that maps ``(state, action)`` to a predicted
-``next_state``. Internally it predicts a *normalized state delta* and
-adds it back to the input state, which is the standard parameterization
-for stable, multi-step rollouts.
+The network predicts a *correction* on top of an analytic ballistic
+step (gravity + applied force, no collisions). This means the model
+only has to learn the wall/ball-collision residual instead of
+rediscovering Newtonian motion from data.
 """
 from __future__ import annotations
 
@@ -14,14 +14,40 @@ import torch
 import torch.nn as nn
 
 
-class DynamicsMLP(nn.Module):
-    """Residual MLP world model.
+def ballistic_step(
+    state: torch.Tensor,
+    action: torch.Tensor,
+    dt: torch.Tensor | float,
+    gravity_y: torch.Tensor | float,
+    mass: torch.Tensor | float,
+) -> torch.Tensor:
+    """Free-flight one-step prediction for any number of balls.
 
-    Parameters are kept in two groups:
-      * ``net``: the learned weights.
-      * normalization buffers (``state_mean``/``state_std`` and the same
-        for the delta target). Stored on the module so a single
-        ``state_dict()`` is enough to reproduce predictions later.
+    ``state`` has shape ``(..., 4N)`` laid out as ``[x, y, vx, vy]`` per
+    ball; ``action`` has shape ``(..., 2N)`` as ``[fx, fy]`` per ball.
+    """
+    *batch, dim = state.shape
+    n = dim // 4
+    s = state.reshape(*batch, n, 4)
+    a = action.reshape(*batch, n, 2)
+    ax = a[..., 0] / mass
+    ay = a[..., 1] / mass + gravity_y
+    x = s[..., 0] + s[..., 2] * dt + 0.5 * ax * dt * dt
+    y = s[..., 1] + s[..., 3] * dt + 0.5 * ay * dt * dt
+    vx = s[..., 2] + ax * dt
+    vy = s[..., 3] + ay * dt
+    out = torch.stack([x, y, vx, vy], dim=-1)
+    return out.reshape(*batch, dim)
+
+
+class DynamicsMLP(nn.Module):
+    """Residual-over-baseline dynamics model.
+
+    ``forward(s, a) = ballistic_step(s, a) + correction(s, a)``
+
+    The correction net is zero-initialized at the final layer so the
+    model starts as pure ballistic motion and learns only the deviation
+    (collisions) from data.
     """
 
     def __init__(
@@ -40,53 +66,50 @@ class DynamicsMLP(nn.Module):
         for _ in range(n_layers):
             layers += [nn.Linear(in_dim, hidden), nn.SiLU()]
             in_dim = hidden
-        layers.append(nn.Linear(in_dim, state_dim))
+        final = nn.Linear(in_dim, state_dim)
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+        layers.append(final)
         self.net = nn.Sequential(*layers)
 
-        # Filled in by ``set_norm`` before training/inference.
+        # Normalization buffers (filled by ``set_norm``).
         self.register_buffer("state_mean", torch.zeros(state_dim))
         self.register_buffer("state_std", torch.ones(state_dim))
-        self.register_buffer("delta_mean", torch.zeros(state_dim))
-        self.register_buffer("delta_std", torch.ones(state_dim))
-        # Action gets a single scale, not per-dim — forces are isotropic.
+        self.register_buffer("c_scale", torch.ones(state_dim))
         self.register_buffer("action_scale", torch.ones(1))
+        # Physics constants (filled by ``set_physics``).
+        self.register_buffer("dt", torch.tensor(1.0 / 60.0))
+        self.register_buffer("gravity_y", torch.tensor(900.0))
+        self.register_buffer("mass", torch.tensor(1.0))
 
     def set_norm(
         self,
         state_mean: np.ndarray,
         state_std: np.ndarray,
-        delta_mean: np.ndarray,
-        delta_std: np.ndarray,
+        c_scale: np.ndarray,
         action_scale: float = 1.0,
     ) -> None:
         self.state_mean.copy_(torch.as_tensor(state_mean, dtype=torch.float32))
         self.state_std.copy_(torch.as_tensor(state_std, dtype=torch.float32))
-        self.delta_mean.copy_(torch.as_tensor(delta_mean, dtype=torch.float32))
-        self.delta_std.copy_(torch.as_tensor(delta_std, dtype=torch.float32))
+        self.c_scale.copy_(torch.as_tensor(c_scale, dtype=torch.float32))
         self.action_scale.fill_(float(action_scale))
 
-    def predict_delta_norm(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        s = (state - self.state_mean) / self.state_std
-        a = action / self.action_scale
-        return self.net(torch.cat([s, a], dim=-1))
+    def set_physics(self, dt: float, gravity_y: float, mass: float) -> None:
+        self.dt.fill_(float(dt))
+        self.gravity_y.fill_(float(gravity_y))
+        self.mass.fill_(float(mass))
+
+    def correction(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        s_n = (state - self.state_mean) / self.state_std
+        a_n = action / self.action_scale
+        return self.net(torch.cat([s_n, a_n], dim=-1)) * self.c_scale
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """Predict the next state (un-normalized)."""
-        delta_norm = self.predict_delta_norm(state, action)
-        delta = delta_norm * self.delta_std + self.delta_mean
-        return state + delta
+        base = ballistic_step(state, action, self.dt, self.gravity_y, self.mass)
+        return base + self.correction(state, action)
 
     @torch.no_grad()
-    def rollout(
-        self,
-        state0: np.ndarray,
-        actions: np.ndarray,
-    ) -> np.ndarray:
-        """Autoregressively roll forward from ``state0``.
-
-        ``actions`` has shape ``(T, action_dim)``. Returns an array of
-        shape ``(T+1, state_dim)`` starting with ``state0``.
-        """
+    def rollout(self, state0: np.ndarray, actions: np.ndarray) -> np.ndarray:
         device = self.state_mean.device
         s = torch.as_tensor(state0, dtype=torch.float32, device=device).unsqueeze(0)
         out = [s.squeeze(0).cpu().numpy()]
@@ -98,7 +121,6 @@ class DynamicsMLP(nn.Module):
 
 
 def load(path: str | Path, map_location: str | torch.device = "cpu") -> DynamicsMLP:
-    """Reconstruct a model from a checkpoint written by ``train.py``."""
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
     cfg = ckpt["config"]
     model = DynamicsMLP(
