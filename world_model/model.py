@@ -1,9 +1,15 @@
 """PyTorch state-space world model: residual over a free-flight baseline.
 
-The network predicts a *correction* on top of an analytic ballistic
-step (gravity + applied force, no collisions). This means the model
-only has to learn the wall/ball-collision residual instead of
-rediscovering Newtonian motion from data.
+The network has a shared trunk and two heads:
+  * ``mean_head`` predicts a *correction* on top of an analytic ballistic
+    step (gravity + applied force, no collisions).
+  * ``logvar_head`` predicts a log-variance for each output dim,
+    interpreted in normalized (per-``state_std``) units. Used only when
+    the model is trained with Gaussian NLL.
+
+``forward()`` returns the deterministic mean prediction.
+``predict_with_var()`` returns ``(mean, log_var_normalized)`` for use
+with the NLL loss and uncertainty reporting.
 """
 from __future__ import annotations
 
@@ -21,11 +27,7 @@ def ballistic_step(
     gravity_y: torch.Tensor | float,
     mass: torch.Tensor | float,
 ) -> torch.Tensor:
-    """Free-flight one-step prediction for any number of balls.
-
-    ``state`` has shape ``(..., 4N)`` laid out as ``[x, y, vx, vy]`` per
-    ball; ``action`` has shape ``(..., 2N)`` as ``[fx, fy]`` per ball.
-    """
+    """Free-flight one-step prediction. ``state`` ``(..., 4N)``, ``action`` ``(..., 2N)``."""
     *batch, dim = state.shape
     n = dim // 4
     s = state.reshape(*batch, n, 4)
@@ -41,15 +43,6 @@ def ballistic_step(
 
 
 class DynamicsMLP(nn.Module):
-    """Residual-over-baseline dynamics model.
-
-    ``forward(s, a) = ballistic_step(s, a) + correction(s, a)``
-
-    The correction net is zero-initialized at the final layer so the
-    model starts as pure ballistic motion and learns only the deviation
-    (collisions) from data.
-    """
-
     def __init__(
         self,
         state_dim: int,
@@ -61,23 +54,28 @@ class DynamicsMLP(nn.Module):
         self.state_dim = state_dim
         self.action_dim = action_dim
 
-        layers: list[nn.Module] = []
+        trunk: list[nn.Module] = []
         in_dim = state_dim + action_dim
         for _ in range(n_layers):
-            layers += [nn.Linear(in_dim, hidden), nn.SiLU()]
+            trunk += [nn.Linear(in_dim, hidden), nn.SiLU()]
             in_dim = hidden
-        final = nn.Linear(in_dim, state_dim)
-        nn.init.zeros_(final.weight)
-        nn.init.zeros_(final.bias)
-        layers.append(final)
-        self.net = nn.Sequential(*layers)
+        self.trunk = nn.Sequential(*trunk)
 
-        # Normalization buffers (filled by ``set_norm``).
+        # Two heads off the shared trunk.
+        self.mean_head = nn.Linear(hidden, state_dim)
+        self.logvar_head = nn.Linear(hidden, state_dim)
+        # Start the correction at zero (pure baseline) and start the
+        # predicted log-variance at zero (≈ unit variance in normalized
+        # units, i.e. variance ~ state_std^2 in raw units).
+        nn.init.zeros_(self.mean_head.weight)
+        nn.init.zeros_(self.mean_head.bias)
+        nn.init.zeros_(self.logvar_head.weight)
+        nn.init.zeros_(self.logvar_head.bias)
+
         self.register_buffer("state_mean", torch.zeros(state_dim))
         self.register_buffer("state_std", torch.ones(state_dim))
         self.register_buffer("c_scale", torch.ones(state_dim))
         self.register_buffer("action_scale", torch.ones(1))
-        # Physics constants (filled by ``set_physics``).
         self.register_buffer("dt", torch.tensor(1.0 / 60.0))
         self.register_buffer("gravity_y", torch.tensor(900.0))
         self.register_buffer("mass", torch.tensor(1.0))
@@ -99,14 +97,33 @@ class DynamicsMLP(nn.Module):
         self.gravity_y.fill_(float(gravity_y))
         self.mass.fill_(float(mass))
 
-    def correction(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    def _trunk(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         s_n = (state - self.state_mean) / self.state_std
         a_n = action / self.action_scale
-        return self.net(torch.cat([s_n, a_n], dim=-1)) * self.c_scale
+        return self.trunk(torch.cat([s_n, a_n], dim=-1))
+
+    def correction(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        h = self._trunk(state, action)
+        return self.mean_head(h) * self.c_scale
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         base = ballistic_step(state, action, self.dt, self.gravity_y, self.mass)
         return base + self.correction(state, action)
+
+    def predict_with_var(
+        self, state: torch.Tensor, action: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``(next_state_mean, log_var_normalized)``.
+
+        ``log_var_normalized`` is in units where ``state_std`` is the
+        natural scale: variance in raw state units is
+        ``exp(log_var_normalized) * state_std**2``.
+        """
+        h = self._trunk(state, action)
+        corr = self.mean_head(h) * self.c_scale
+        log_var = self.logvar_head(h)
+        base = ballistic_step(state, action, self.dt, self.gravity_y, self.mass)
+        return base + corr, log_var
 
     @torch.no_grad()
     def rollout(self, state0: np.ndarray, actions: np.ndarray) -> np.ndarray:

@@ -48,6 +48,8 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--regenerate", action="store_true", help="Force dataset regeneration")
+    p.add_argument("--force-scale", type=float, default=0.0, help="std of random forces injected during data generation")
+    p.add_argument("--stochastic", action="store_true", help="train with Gaussian NLL using the variance head")
     args = p.parse_args()
 
     if args.regenerate or not args.data.exists():
@@ -57,6 +59,7 @@ def main() -> None:
             n_episodes=args.episodes,
             steps_per_episode=args.steps,
             spec=SceneSpec(n_balls=args.n_balls),
+            force_scale=args.force_scale,
             seed=args.seed,
         )
         print(info)
