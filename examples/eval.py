@@ -15,7 +15,7 @@ import torch
 
 from world_model.dataset import SceneSpec, _reset_scene
 from world_model.env import PhysicsEnv
-from world_model.model import ballistic_step, load as load_model
+from world_model.model import ballistic_step, reflect_walls, load as load_model
 
 
 def _split_state(state: np.ndarray, n_balls: int) -> tuple[np.ndarray, np.ndarray]:
@@ -31,16 +31,28 @@ def _set_world_to_state(env: PhysicsEnv, state: np.ndarray) -> None:
         body.vel = row[2:].astype(np.float64).copy()
 
 
-def baseline_rollout(s0: np.ndarray, horizon: int, dt: float, gravity_y: float, mass: float) -> np.ndarray:
-    """Autoregressive ballistic-only rollout (no learned correction)."""
+def baseline_rollout(
+    s0: np.ndarray,
+    horizon: int,
+    dt: float,
+    gravity_y: float,
+    mass: float,
+    wall_min: torch.Tensor | None = None,
+    wall_max: torch.Tensor | None = None,
+    wall_e: float = 0.0,
+) -> np.ndarray:
+    """Autoregressive analytic rollout (ballistic + optional wall reflection)."""
     s = torch.as_tensor(s0, dtype=torch.float32).unsqueeze(0)
     a = torch.zeros((1, s0.shape[0] // 2), dtype=torch.float32)
     out = [s.squeeze(0).numpy()]
     dt_t = torch.tensor(dt)
     g_t = torch.tensor(gravity_y)
     m_t = torch.tensor(mass)
+    use_walls = wall_min is not None and wall_max is not None
     for _ in range(horizon):
         s = ballistic_step(s, a, dt_t, g_t, m_t)
+        if use_walls:
+            s = reflect_walls(s, wall_min, wall_max, wall_e)
         out.append(s.squeeze(0).numpy())
     return np.stack(out)
 
@@ -64,12 +76,16 @@ def run_episode(
 
     actions = np.zeros((horizon, 2 * spec.n_balls), dtype=np.float32)
     pred_traj = model.rollout(s0, actions)
+    walls_set = bool(torch.isfinite(model.wall_min).all())
     base_traj = baseline_rollout(
         s0,
         horizon,
         dt=float(model.dt.item()),
         gravity_y=float(model.gravity_y.item()),
         mass=float(model.mass.item()),
+        wall_min=model.wall_min if walls_set else None,
+        wall_max=model.wall_max if walls_set else None,
+        wall_e=float(model.wall_e.item()),
     )
     return true_traj, pred_traj, base_traj
 
