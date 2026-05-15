@@ -64,10 +64,13 @@ class PhysicsEnv:
         """``action`` is an (N, 2) array of forces, one per body, or None."""
         if action is not None:
             action = np.asarray(action, dtype=np.float64)
-            for body, force in zip(self.world.bodies, action):
-                body.apply_force(force)
         h = self.dt / self.substeps
         for _ in range(self.substeps):
+            # Re-apply per substep: world.step zeros _force after integrating,
+            # so without this the action would only act during the first substep.
+            if action is not None:
+                for body, force in zip(self.world.bodies, action):
+                    body.apply_force(force)
             self.world.step(h)
         self.renderer.draw(self.world)
         return self.observation()

@@ -26,6 +26,7 @@ class SceneSpec:
 
 def _reset_scene(env: PhysicsEnv, spec: SceneSpec, rng: np.random.Generator) -> None:
     env.world.bodies.clear()
+    env.world.time = 0.0
     margin = spec.radius + 4.0
     for _ in range(spec.n_balls):
         env.add_ball(
