@@ -205,17 +205,23 @@ def main() -> None:
             )
 
     if args.save_frames is not None:
-        env_true = PhysicsEnv(width=width, height=height, headless=True)
-        env_pred = PhysicsEnv(width=width, height=height, headless=True)
+        env_true_v = PhysicsEnv(width=width, height=height, headless=True)
+        env_base_v = PhysicsEnv(width=width, height=height, headless=True)
+        env_pred_v = PhysicsEnv(width=width, height=height, headless=True)
         rng2 = np.random.default_rng(args.seed + 1000)
-        t, p_, _ = run_episode(env_true, model, spec, args.horizon, rng2)
-        # ``run_episode`` advances env_true to the final state — that's fine,
-        # we re-seed positions via ``_set_world_to_state`` per frame.
-        # env_pred needs the same bodies (count/radius) but no real motion.
-        _reset_scene(env_pred, spec, np.random.default_rng(args.seed + 1000))
-        save_side_by_side(env_true, env_pred, t, p_, args.save_frames)
-        env_true.close()
-        env_pred.close()
+        t_traj, p_traj, b_traj = run_episode(env_true_v, model, spec, args.horizon, rng2)
+        # The other two envs need bodies in place so _set_world_to_state can
+        # write into them; physics state is then overwritten per frame.
+        _reset_scene(env_base_v, spec, np.random.default_rng(args.seed + 1000))
+        _reset_scene(env_pred_v, spec, np.random.default_rng(args.seed + 1000))
+        out_path = args.save_frames
+        if out_path.suffix != ".gif":
+            out_path.mkdir(parents=True, exist_ok=True)
+            out_path = out_path / "comparison.gif"
+        save_comparison_gif(env_true_v, env_base_v, env_pred_v, t_traj, b_traj, p_traj, out_path)
+        env_true_v.close()
+        env_base_v.close()
+        env_pred_v.close()
 
 
 if __name__ == "__main__":
