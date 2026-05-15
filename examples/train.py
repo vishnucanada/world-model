@@ -79,6 +79,16 @@ def main() -> None:
     model = DynamicsMLP(state_dim, action_dim, hidden=args.hidden, n_layers=args.layers).to(device)
     model.set_physics(dt=dt, gravity_y=gravity_y, mass=mass)
 
+    radius = float(data["radius"])
+    restitution = float(data["restitution"])
+    wall_margin = float(data["wall_margin"])
+    width = float(data["width"])
+    height = float(data["height"])
+    inner = wall_margin + radius
+    wall_min = [inner, inner]
+    wall_max = [width - inner, height - inner]
+    model.set_walls(wall_min, wall_max, restitution)
+
     s_flat = torch.from_numpy(states[:, :-1].reshape(-1, state_dim))
     sn_flat = torch.from_numpy(states[:, 1:].reshape(-1, state_dim))
     a_flat = torch.from_numpy(actions.reshape(-1, action_dim))
@@ -89,6 +99,12 @@ def main() -> None:
             torch.tensor(dt),
             torch.tensor(gravity_y),
             torch.tensor(mass),
+        )
+        base = reflect_walls(
+            base,
+            torch.tensor(wall_min, dtype=torch.float32),
+            torch.tensor(wall_max, dtype=torch.float32),
+            restitution,
         )
         c_scale = (sn_flat - base).std(dim=0).numpy() + 1e-6
     action_scale = float(np.abs(actions).mean() + 1e-3) if actions.any() else 1.0
@@ -201,6 +217,9 @@ def main() -> None:
                 "dt": dt,
                 "gravity_y": gravity_y,
                 "mass": mass,
+                "wall_min": wall_min,
+                "wall_max": wall_max,
+                "wall_e": restitution,
             },
         },
         args.out,
