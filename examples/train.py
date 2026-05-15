@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from world_model.dataset import SceneSpec, generate
-from world_model.model import DynamicsMLP, ballistic_step, reflect_walls
+from world_model.model import DynamicsMLP, GraphDynamics, ballistic_step, reflect_walls
 
 
 def load_transitions(path: Path) -> dict:
@@ -45,6 +45,9 @@ def main() -> None:
     p.add_argument("--lr-min", type=float, default=1e-4)
     p.add_argument("--hidden", type=int, default=384)
     p.add_argument("--layers", type=int, default=3)
+    p.add_argument("--model", choices=["mlp", "graph"], default="mlp",
+                   help="mlp = flat-state DynamicsMLP; graph = permutation-equivariant interaction net")
+    p.add_argument("--msg-hidden", type=int, default=64, help="message-MLP hidden width (graph only)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--regenerate", action="store_true", help="Force dataset regeneration")
@@ -76,7 +79,15 @@ def main() -> None:
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
 
-    model = DynamicsMLP(state_dim, action_dim, hidden=args.hidden, n_layers=args.layers).to(device)
+    n_balls = state_dim // 4
+    if args.model == "graph":
+        model = GraphDynamics(
+            n_balls=n_balls, hidden=args.hidden, msg_hidden=args.msg_hidden
+        ).to(device)
+    else:
+        model = DynamicsMLP(
+            state_dim, action_dim, hidden=args.hidden, n_layers=args.layers
+        ).to(device)
     model.set_physics(dt=dt, gravity_y=gravity_y, mass=mass)
 
     radius = float(data["radius"])
@@ -106,14 +117,24 @@ def main() -> None:
             torch.tensor(wall_max, dtype=torch.float32),
             restitution,
         )
-        c_scale = (sn_flat - base).std(dim=0).numpy() + 1e-6
+        residual = (sn_flat - base).numpy()
     action_scale = float(np.abs(actions).mean() + 1e-3) if actions.any() else 1.0
-    model.set_norm(
-        state_mean=data["state_mean"],
-        state_std=data["state_std"],
-        c_scale=c_scale,
-        action_scale=action_scale,
-    )
+
+    if args.model == "graph":
+        # Per-ball stats — every ball is identical so we share one (4,) vector.
+        flat_per_ball = states.reshape(-1, 4)
+        ball_mean = flat_per_ball.mean(axis=0)
+        ball_std = flat_per_ball.std(axis=0) + 1e-6
+        c_scale_per_ball = residual.reshape(-1, 4).std(axis=0) + 1e-6
+        model.set_norm(ball_mean, ball_std, c_scale_per_ball, action_scale)
+    else:
+        c_scale = residual.std(axis=0) + 1e-6
+        model.set_norm(
+            state_mean=data["state_mean"],
+            state_std=data["state_std"],
+            c_scale=c_scale,
+            action_scale=action_scale,
+        )
 
     states_t = torch.from_numpy(states).to(device)
     actions_t = torch.from_numpy(actions).to(device)
@@ -207,10 +228,12 @@ def main() -> None:
         {
             "state_dict": model.state_dict(),
             "config": {
+                "model_type": args.model,
                 "state_dim": state_dim,
                 "action_dim": action_dim,
                 "hidden": args.hidden,
                 "n_layers": args.layers,
+                "msg_hidden": args.msg_hidden,
                 "n_balls": int(data["n_balls"]),
                 "width": int(data["width"]),
                 "height": int(data["height"]),
