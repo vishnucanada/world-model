@@ -108,31 +108,54 @@ def horizon_errors(
     }
 
 
-def save_side_by_side(
+def save_comparison_gif(
     env_true: PhysicsEnv,
+    env_base: PhysicsEnv,
     env_pred: PhysicsEnv,
     true_traj: np.ndarray,
+    base_traj: np.ndarray,
     pred_traj: np.ndarray,
-    out_dir: Path,
-    every: int = 4,
+    out_path: Path,
+    fps: int = 30,
 ) -> None:
+    """Three-panel animated GIF: truth | analytic baseline | learned model."""
     try:
-        from PIL import Image
+        from PIL import Image, ImageDraw
     except ImportError:
-        print("pillow not installed; skipping image dump")
+        print("pillow not installed; skipping GIF")
         return
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for t in range(0, true_traj.shape[0], every):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    frames = []
+    horizon = true_traj.shape[0]
+    for t in range(horizon):
         _set_world_to_state(env_true, true_traj[t])
+        _set_world_to_state(env_base, base_traj[t])
         _set_world_to_state(env_pred, pred_traj[t])
         env_true.renderer.draw(env_true.world)
+        env_base.renderer.draw(env_base.world)
         env_pred.renderer.draw(env_pred.world)
-        left = env_true.renderer.frame()
-        right = env_pred.renderer.frame()
-        gap = np.full((left.shape[0], 4, 3), 60, dtype=np.uint8)
-        side = np.concatenate([left, gap, right], axis=1)
-        Image.fromarray(side).save(out_dir / f"cmp_{t:04d}.png")
-    print(f"saved comparison frames -> {out_dir}/  (left=truth, right=model)")
+        a = env_true.renderer.frame()
+        b = env_base.renderer.frame()
+        c = env_pred.renderer.frame()
+        gap = np.full((a.shape[0], 4, 3), 60, dtype=np.uint8)
+        panel = np.concatenate([a, gap, b, gap, c], axis=1)
+        img = Image.fromarray(panel)
+        draw = ImageDraw.Draw(img)
+        w = a.shape[1]
+        draw.text((4, 4), "truth", fill=(255, 255, 255))
+        draw.text((w + 8, 4), "baseline", fill=(255, 255, 255))
+        draw.text((2 * w + 12, 4), "model", fill=(255, 255, 255))
+        draw.text((panel.shape[1] - 50, 4), f"t={t}", fill=(200, 200, 200))
+        frames.append(img)
+    frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=int(1000 / fps),
+        loop=0,
+        optimize=False,
+    )
+    print(f"saved GIF -> {out_path}  ({len(frames)} frames @ {fps} fps)")
 
 
 def main() -> None:
