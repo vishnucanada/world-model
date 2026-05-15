@@ -91,6 +91,9 @@ def generate(
         dt=np.float32(env.dt),
         gravity_y=np.float32(env.world.gravity[1]),
         mass=np.float32(spec.mass),
+        radius=np.float32(spec.radius),
+        restitution=np.float32(spec.restitution),
+        wall_margin=np.float32(8.0),  # matches env._build_default_scene
     )
     return {
         "episodes": n_episodes,

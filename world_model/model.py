@@ -107,6 +107,10 @@ class DynamicsMLP(nn.Module):
         self.register_buffer("dt", torch.tensor(1.0 / 60.0))
         self.register_buffer("gravity_y", torch.tensor(900.0))
         self.register_buffer("mass", torch.tensor(1.0))
+        # Wall bounds default to ±inf -> reflect_walls is a no-op until set.
+        self.register_buffer("wall_min", torch.full((2,), float("-inf")))
+        self.register_buffer("wall_max", torch.full((2,), float("inf")))
+        self.register_buffer("wall_e", torch.tensor(0.0))
 
     def set_norm(
         self,
@@ -125,6 +129,15 @@ class DynamicsMLP(nn.Module):
         self.gravity_y.fill_(float(gravity_y))
         self.mass.fill_(float(mass))
 
+    def set_walls(self, wall_min, wall_max, restitution: float) -> None:
+        self.wall_min.copy_(torch.as_tensor(wall_min, dtype=torch.float32))
+        self.wall_max.copy_(torch.as_tensor(wall_max, dtype=torch.float32))
+        self.wall_e.fill_(float(restitution))
+
+    def _baseline(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        base = ballistic_step(state, action, self.dt, self.gravity_y, self.mass)
+        return reflect_walls(base, self.wall_min, self.wall_max, self.wall_e)
+
     def _trunk(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         s_n = (state - self.state_mean) / self.state_std
         a_n = action / self.action_scale
@@ -135,8 +148,7 @@ class DynamicsMLP(nn.Module):
         return self.mean_head(h) * self.c_scale
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        base = ballistic_step(state, action, self.dt, self.gravity_y, self.mass)
-        return base + self.correction(state, action)
+        return self._baseline(state, action) + self.correction(state, action)
 
     def predict_with_var(
         self, state: torch.Tensor, action: torch.Tensor
@@ -150,8 +162,7 @@ class DynamicsMLP(nn.Module):
         h = self._trunk(state, action)
         corr = self.mean_head(h) * self.c_scale
         log_var = self.logvar_head(h)
-        base = ballistic_step(state, action, self.dt, self.gravity_y, self.mass)
-        return base + corr, log_var
+        return self._baseline(state, action) + corr, log_var
 
     @torch.no_grad()
     def rollout(self, state0: np.ndarray, actions: np.ndarray) -> np.ndarray:
@@ -174,6 +185,9 @@ def load(path: str | Path, map_location: str | torch.device = "cpu") -> Dynamics
         hidden=cfg["hidden"],
         n_layers=cfg["n_layers"],
     )
-    model.load_state_dict(ckpt["state_dict"])
+    # strict=False so checkpoints saved before wall buffers were added still load.
+    model.load_state_dict(ckpt["state_dict"], strict=False)
+    if "wall_min" in cfg and "wall_max" in cfg:
+        model.set_walls(cfg["wall_min"], cfg["wall_max"], cfg.get("wall_e", 0.0))
     model.eval()
     return model

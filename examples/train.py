@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from world_model.dataset import SceneSpec, generate
-from world_model.model import DynamicsMLP, ballistic_step
+from world_model.model import DynamicsMLP, ballistic_step, reflect_walls
 
 
 def load_transitions(path: Path) -> dict:
