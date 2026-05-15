@@ -42,6 +42,34 @@ def ballistic_step(
     return out.reshape(*batch, dim)
 
 
+def reflect_walls(
+    state: torch.Tensor,
+    wall_min: torch.Tensor,
+    wall_max: torch.Tensor,
+    restitution: torch.Tensor | float,
+) -> torch.Tensor:
+    """Axis-aligned ball-wall reflection on a (..., 4N) state.
+
+    Clamps each ball's position into ``[wall_min, wall_max]`` and flips the
+    inward velocity component, scaled by ``restitution``. With ``wall_min`` /
+    ``wall_max`` set to -/+inf this is a no-op, so old checkpoints behave
+    identically until ``set_walls`` is called.
+    """
+    *batch, dim = state.shape
+    n = dim // 4
+    s = state.reshape(*batch, n, 4)
+    pos = s[..., :2]
+    vel = s[..., 2:]
+    under = pos < wall_min
+    over = pos > wall_max
+    new_pos = torch.where(under, wall_min, pos)
+    new_pos = torch.where(over, wall_max, new_pos)
+    flip = (under & (vel < 0)) | (over & (vel > 0))
+    new_vel = torch.where(flip, -restitution * vel, vel)
+    out = torch.cat([new_pos, new_vel], dim=-1)
+    return out.reshape(*batch, dim)
+
+
 class DynamicsMLP(nn.Module):
     def __init__(
         self,
