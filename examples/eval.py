@@ -174,9 +174,10 @@ def main() -> None:
     args = p.parse_args()
 
     model = load_model(args.ckpt, map_location=args.device)
+    cfg = torch.load(args.ckpt, map_location=args.device, weights_only=False)["config"]
     cfg_n_balls = model.state_dim // 4
-    width = 320
-    height = 240
+    width = int(cfg.get("width", 320))
+    height = int(cfg.get("height", 240))
 
     spec = SceneSpec(n_balls=cfg_n_balls, width=width, height=height)
     env = PhysicsEnv(width=width, height=height, headless=True)
