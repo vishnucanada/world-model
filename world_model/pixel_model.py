@@ -91,13 +91,20 @@ class PixelWorldModel(nn.Module):
         action_dim: int = 0,
         ch: int = 32,
         hidden: int = 128,
+        state_dim: int = 0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.action_dim = action_dim
+        self.state_dim = state_dim
         self.encoder = Encoder(ch, latent_dim)
         self.decoder = Decoder(ch, latent_dim)
         self.dynamics = Dynamics(latent_dim, action_dim, hidden)
+        # Optional: linear probe from latent to normalized state. Trained with an
+        # auxiliary MSE loss so the latent is forced to carry position+velocity
+        # info — without this, the encoder collapses to a constant under
+        # joint dynamics training.
+        self.state_head = nn.Linear(latent_dim, state_dim) if state_dim > 0 else None
 
     def encode(self, frames: torch.Tensor) -> torch.Tensor:
         """Accepts ``(..., 3, H, W)`` floats in [0,1]; returns ``(..., latent_dim)``."""
@@ -147,7 +154,8 @@ def load(path: str | Path, map_location: str | torch.device = "cpu") -> PixelWor
         action_dim=cfg["action_dim"],
         ch=cfg["ch"],
         hidden=cfg["hidden"],
+        state_dim=cfg.get("state_dim", 0),
     )
-    model.load_state_dict(ckpt["state_dict"])
+    model.load_state_dict(ckpt["state_dict"], strict=False)
     model.eval()
     return model
