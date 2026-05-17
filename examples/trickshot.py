@@ -88,7 +88,9 @@ def main() -> None:
     p.add_argument("--horizon", type=int, default=60, help="rollout length in steps")
     p.add_argument("--steps", type=int, default=300, help="optimizer iterations")
     p.add_argument("--lr", type=float, default=8.0)
-    p.add_argument("--init-speed", type=float, default=220.0)
+    p.add_argument("--init-speed", type=float, default=200.0)
+    p.add_argument("--max-speed", type=float, default=250.0,
+                   help="clamp cue speed after each opt step (training data had |v|<=212)")
     p.add_argument("--cue", type=float, nargs=2, default=[60.0, 120.0],
                    help="cue ball (x, y)")
     p.add_argument("--target", type=float, nargs=2, default=[180.0, 130.0],
@@ -170,6 +172,10 @@ def main() -> None:
         opt.zero_grad()
         loss.backward()
         opt.step()
+        with torch.no_grad():
+            spd = cue_v.norm()
+            if spd > args.max_speed:
+                cue_v.mul_(args.max_speed / spd)
         if (it + 1) % 50 == 0 or it == 0:
             print(
                 f"  iter {it+1:4d}  min_d={actual_min_d2.item()**0.5:6.1f}px  "
