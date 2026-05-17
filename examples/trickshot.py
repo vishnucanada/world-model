@@ -126,11 +126,15 @@ def main() -> None:
     init_state = np.array([v for ball in scene for v in ball], dtype=np.float32)
     base_state = torch.tensor(init_state)
 
-    # Initialize cue velocity aimed at the target — gives the optimizer a
-    # reasonable starting point but still requires it to figure out the offset
-    # that makes the target travel toward the goal.
-    to_target = target_pos - cue_pos
-    init_dir = to_target / (np.linalg.norm(to_target) + 1e-6)
+    # Initialize cue velocity aimed at the *contact point* on the target ball
+    # such that the line-of-centers at impact points toward the goal. Without
+    # this prior, the optimizer easily falls into a "miss the target" local
+    # minimum where the target stays put at its initial distance to the goal.
+    goal_dir = (goal - target_pos)
+    goal_dir = goal_dir / (np.linalg.norm(goal_dir) + 1e-6)
+    contact_point = target_pos - 2 * 12.0 * goal_dir  # 2 * ball radius
+    to_contact = contact_point - cue_pos
+    init_dir = to_contact / (np.linalg.norm(to_contact) + 1e-6)
     cue_v = torch.tensor(init_dir * args.init_speed, dtype=torch.float32, requires_grad=True)
 
     goal_t = torch.tensor(goal, dtype=torch.float32)
@@ -144,17 +148,32 @@ def main() -> None:
         # Build initial state with cue velocity = optimization variable.
         s = torch.cat([base_state[:2], cue_v, base_state[4:]]).unsqueeze(0)
         dists2 = []
+        cue_target_d2 = []
         for _ in range(args.horizon):
             s = model(s, zero_actions)
-            target_xy = s.reshape(1, n_balls, 4)[0, 1, :2]
+            ball_xy = s.reshape(1, n_balls, 4)[0, :, :2]
+            target_xy = ball_xy[1]
+            cue_xy = ball_xy[0]
             dists2.append(((target_xy - goal_t) ** 2).sum())
-        loss = torch.stack(dists2).min()
+            cue_target_d2.append(((cue_xy - target_xy) ** 2).sum())
+        d2_stack = torch.stack(dists2)
+        # Primary loss: closest-approach of target to goal.
+        # Mean term keeps pressure on if the optimizer drifts toward "miss".
+        # Cue-target proximity ensures we actually hit (small weight; only matters
+        # when target stays still and `min` is uninformative).
+        actual_min_d2 = d2_stack.detach().min()
+        loss = (
+            d2_stack.min()
+            + 0.05 * d2_stack.mean()
+            + 0.1 * torch.stack(cue_target_d2).min()
+        )
         opt.zero_grad()
         loss.backward()
         opt.step()
         if (it + 1) % 50 == 0 or it == 0:
             print(
-                f"  iter {it+1:4d}  min_dist={loss.item()**0.5:6.1f}px  "
+                f"  iter {it+1:4d}  min_d={actual_min_d2.item()**0.5:6.1f}px  "
+                f"loss={loss.item():8.1f}  "
                 f"v=[{cue_v[0].item():+7.1f}, {cue_v[1].item():+7.1f}]"
             )
 
