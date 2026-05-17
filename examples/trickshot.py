@@ -109,21 +109,13 @@ def main() -> None:
     target_pos = np.array(args.target, dtype=np.float32)
     goal = np.array(args.goal, dtype=np.float32)
 
-    # Graph net handles any N, but we keep at least the trained count so
-    # buffers and statistics fall inside their training distribution.
-    n_balls = max(2, model.n_balls)
-    rng = np.random.default_rng(0)
+    # Graph net is permutation-equivariant — runs cleanly at N=2 even though
+    # it was trained at N=5. Per-ball stats apply uniformly.
+    n_balls = 2
     scene = [
         (float(cue_pos[0]), float(cue_pos[1]), 0.0, 0.0),
         (float(target_pos[0]), float(target_pos[1]), 0.0, 0.0),
     ]
-    # Park distractor balls in a corner well clear of the shot line.
-    while len(scene) < n_balls:
-        scene.append((
-            float(rng.uniform(25, 60)),
-            float(rng.uniform(H - 60, H - 30)),
-            0.0, 0.0,
-        ))
 
     init_state = np.array([v for ball in scene for v in ball], dtype=np.float32)
     base_state = torch.tensor(init_state)
