@@ -40,6 +40,13 @@ def _reset_scene(env: PhysicsEnv, spec: SceneSpec, rng: np.random.Generator) -> 
         )
 
 
+def _render_resized(env: PhysicsEnv, size: tuple[int, int]) -> np.ndarray:
+    """Grab the current rendered frame and resize to ``(w, h)``."""
+    from PIL import Image
+    frame = env.observation()["frame"]
+    return np.asarray(Image.fromarray(frame).resize(size, Image.BILINEAR))
+
+
 def generate(
     out_path: str | Path,
     n_episodes: int = 200,
@@ -47,8 +54,13 @@ def generate(
     spec: SceneSpec | None = None,
     force_scale: float = 0.0,
     seed: int = 0,
+    frame_size: tuple[int, int] | None = None,
 ) -> dict:
-    """Generate episode trajectories and write them to ``out_path`` as .npz."""
+    """Generate episode trajectories and write them to ``out_path`` as .npz.
+
+    If ``frame_size=(w, h)`` is given, also save resized RGB frames
+    (uint8) for pixel-based world model training.
+    """
     spec = spec or SceneSpec()
     rng = np.random.default_rng(seed)
     env = PhysicsEnv(width=spec.width, height=spec.height, headless=True)
@@ -58,10 +70,16 @@ def generate(
 
     states = np.empty((n_episodes, steps_per_episode + 1, state_dim), dtype=np.float32)
     actions = np.empty((n_episodes, steps_per_episode, action_dim), dtype=np.float32)
+    if frame_size is not None:
+        fw, fh = frame_size
+        frames = np.empty((n_episodes, steps_per_episode + 1, fh, fw, 3), dtype=np.uint8)
 
     for ep in range(n_episodes):
         _reset_scene(env, spec, rng)
         states[ep, 0] = env.world.state_vector()
+        if frame_size is not None:
+            env.renderer.draw(env.world)
+            frames[ep, 0] = _render_resized(env, frame_size)
         for t in range(steps_per_episode):
             if force_scale > 0.0:
                 a = rng.normal(0.0, force_scale, size=(spec.n_balls, 2)).astype(np.float32)
@@ -70,6 +88,8 @@ def generate(
             env.step(action=a)
             states[ep, t + 1] = env.world.state_vector()
             actions[ep, t] = a.reshape(-1)
+            if frame_size is not None:
+                frames[ep, t + 1] = _render_resized(env, frame_size)
 
     env.close()
 
@@ -79,8 +99,7 @@ def generate(
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_path,
+    arrays = dict(
         states=states,
         actions=actions,
         state_mean=state_mean,
@@ -95,6 +114,11 @@ def generate(
         restitution=np.float32(spec.restitution),
         wall_margin=np.float32(8.0),  # matches env._build_default_scene
     )
+    if frame_size is not None:
+        arrays["frames"] = frames
+        arrays["frame_w"] = np.int32(frame_size[0])
+        arrays["frame_h"] = np.int32(frame_size[1])
+    np.savez_compressed(out_path, **arrays)
     return {
         "episodes": n_episodes,
         "steps_per_episode": steps_per_episode,
