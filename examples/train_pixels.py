@@ -115,16 +115,23 @@ def main() -> None:
 
             z_seq = model.encode(f_in)                  # (B, K+1, latent)
             recon = model.decode(z_seq)
-            L_recon = F.mse_loss(recon, f_in)
+            # L1 loss: doesn't reward blurry averages the way L2 does, which
+            # matters when the "interesting" pixels are sparse (small balls
+            # on a large dark background).
+            L_recon = F.l1_loss(recon, f_in)
 
-            z_pred = [z_seq[:, 0]]
+            # Detach the starting latent so the pred loss only updates the
+            # dynamics+decoder, not the encoder. Without this the encoder
+            # gets pulled toward "produce a generic latent that decodes to
+            # a scene-average" — the source of the collapse.
+            z_pred = [z_seq[:, 0].detach()]
             for k in range(K):
                 z_pred.append(model.step(z_pred[-1], act_seq[:, k]))
             z_pred = torch.stack(z_pred, dim=1)         # (B, K+1, latent)
 
             L_dyn = F.mse_loss(z_pred[:, 1:], z_seq[:, 1:].detach())
             pred_frames = model.decode(z_pred[:, 1:])
-            L_pred = F.mse_loss(pred_frames, f_in[:, 1:])
+            L_pred = F.l1_loss(pred_frames, f_in[:, 1:])
 
             L = L_recon + alpha * L_dyn + beta * L_pred
             opt.zero_grad()
