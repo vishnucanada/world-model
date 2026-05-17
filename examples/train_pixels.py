@@ -43,6 +43,10 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--alpha", type=float, default=1.0, help="latent dynamics loss weight")
     p.add_argument("--beta", type=float, default=1.0, help="pixel prediction loss weight")
+    p.add_argument("--warmup-epochs", type=int, default=5,
+                   help="train autoencoder only (alpha=beta=0) for this many epochs first, "
+                        "then turn on dynamics losses. Without warmup the joint loss collapses "
+                        "to a 'predict scene-average frame' degenerate solution.")
     p.add_argument("--regenerate", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -89,8 +93,14 @@ def main() -> None:
     if starts_max <= 0:
         raise ValueError(f"rollout-len {K} too large for episode length {T}")
 
-    print(f"training {args.epochs} epochs, K={K}, batch={args.batch_size}")
+    print(
+        f"training {args.epochs} epochs ({args.warmup_epochs} autoencoder-only warmup), "
+        f"K={K}, batch={args.batch_size}"
+    )
     for epoch in range(args.epochs):
+        in_warmup = epoch < args.warmup_epochs
+        alpha = 0.0 if in_warmup else args.alpha
+        beta = 0.0 if in_warmup else args.beta
         tot_r = tot_d = tot_p = 0.0
         for _ in range(args.batches_per_epoch):
             ei = torch.randint(0, n_eps, (args.batch_size,))
@@ -116,7 +126,7 @@ def main() -> None:
             pred_frames = model.decode(z_pred[:, 1:])
             L_pred = F.mse_loss(pred_frames, f_in[:, 1:])
 
-            L = L_recon + args.alpha * L_dyn + args.beta * L_pred
+            L = L_recon + alpha * L_dyn + beta * L_pred
             opt.zero_grad()
             L.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -124,9 +134,10 @@ def main() -> None:
             tot_r += L_recon.item(); tot_d += L_dyn.item(); tot_p += L_pred.item()
 
         n_b = args.batches_per_epoch
+        tag = "  [warmup]" if in_warmup else ""
         print(
             f"  epoch {epoch+1:02d}/{args.epochs}  "
-            f"recon={tot_r/n_b:.4f}  dyn={tot_d/n_b:.4f}  pred={tot_p/n_b:.4f}"
+            f"recon={tot_r/n_b:.4f}  dyn={tot_d/n_b:.4f}  pred={tot_p/n_b:.4f}{tag}"
         )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
